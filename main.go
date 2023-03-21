@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	"lnj.com/unix/sockets/list"
@@ -27,19 +28,18 @@ type InputMessage struct {
 }
 
 type Config struct {
-	ConnIn     net.Conn
-	ConnOut    net.Conn
-	Queue      list.DListNode
-	WriteCount int
-	ReadCount  int
+	ConnIn    net.Conn
+	ConnOut   net.Conn
+	Queue     list.DListNode
+	ReadCount int
+	ShutDown  bool
+	AppMutex  sync.Mutex
 }
 
 func main() {
 	var app Config
-	var writeCount int = 0
 	var readCount int = 0
 
-	app.WriteCount = writeCount
 	app.ReadCount = readCount
 
 	queue := priorityqueue.CreatePQueue()
@@ -63,9 +63,9 @@ func main() {
 
 	go func() {
 		<-quit
+		app.ShutDown = true
 		fmt.Println("ctrl-c pressed!")
 		close(quit)
-		os.Exit(0)
 	}()
 
 	go app.handleQueuedMessages()
@@ -83,46 +83,85 @@ func main() {
 }
 
 func (app *Config) handleQueuedMessages() {
-
-	var connOut net.Conn
 	var err error
+	var state string = "start"
+	var ok bool
+	var msg *message.Transport
 
 	for {
-		if !app.Queue.IsEmpty() {
-			for {
-				connOut, err = net.Dial(protocol, sockAddrOut)
-				if err != nil {
-					fmt.Println(err)
-					time.Sleep(5 * time.Second)
+
+		switch state {
+		case "start":
+			if !app.Queue.IsEmpty() {
+				//fmt.Println("QC:", app.Queue.GetNodeCount())
+				app.AppMutex.Lock()
+				ok, msg = app.Queue.Take()
+				app.AppMutex.Unlock()
+				if ok {
+					// do some small work
+					time.Sleep(time.Millisecond * 15)
+					state = "connect"
+				}
+			} else {
+				if app.ShutDown {
+					fmt.Println("sleep 1 for shutdown race")
+					time.Sleep(time.Second * 1)
+					fmt.Println("write shutdown")
+					os.Exit(0)
+				}
+				fmt.Println("RC=", app.ReadCount)
+				time.Sleep(time.Second * 5)
+			}
+
+		case "connect":
+			app.ConnOut, err = net.Dial(protocol, sockAddrOut)
+			if err != nil {
+				fmt.Println(err)
+				fmt.Println("QC:", app.Queue.GetNodeCount())
+				time.Sleep(time.Second * 5)
+			} else {
+				state = "write"
+			}
+
+		case "write":
+			err := msg.Write(app.ConnOut)
+			if err != nil {
+				fmt.Println(err)
+			} else {
+				state = "read"
+			}
+
+		case "read":
+			m := &message.Transport{}
+			err = m.Read(app.ConnOut)
+			if err != nil {
+				fmt.Println(err)
+				state = "start"
+			} else {
+				s := string(m.Data)
+				if s == "hold-messages" {
+					state = "hold-messages"
 				} else {
-					defer connOut.Close()
-					break
+					state = "start"
 				}
 			}
-			fmt.Println("QC:", app.Queue.GetNodeCount())
-			ok, m := app.Queue.Take()
-			if ok {
-				// represents 100 millisecond work on each message
-				time.Sleep(time.Millisecond * 100)
-				err := m.Write(connOut)
-				if err != nil {
-					log.Println(err)
-				} else {
-					app.WriteCount += 1
-				}
+
+		case "hold-messages":
+			app.ConnOut, err = net.Dial(protocol, sockAddrOut)
+			if err == nil {
+				fmt.Println("QC stopped NC:", app.Queue.GetNodeCount())
+				time.Sleep(time.Second * 5)
+			} else {
+				state = "start"
 			}
-		} else {
-			if app.WriteCount != app.ReadCount {
-				fmt.Println("count mis-match: WC=", app.WriteCount, " RC=", app.ReadCount)
-			}
-			fmt.Println("counts: WC=", app.WriteCount, " RC=", app.ReadCount)
-			time.Sleep(5 * time.Second)
 		}
 	}
+
 }
 
 func (app *Config) readInput() {
 	defer app.ConnIn.Close()
+
 	m := &message.Transport{}
 	err := m.Read(app.ConnIn)
 	if err != nil {
@@ -130,5 +169,31 @@ func (app *Config) readInput() {
 		return
 	}
 	app.ReadCount += 1
+	app.AppMutex.Lock()
 	app.Queue.PriorityPut(m, 0)
+	app.AppMutex.Unlock()
+
+	if app.ShutDown {
+		fmt.Println("read shutdown signal")
+		mb := &message.Transport{}
+		msg := "hold-messages"
+		mb.Length = len(msg)
+		mb.Data = []byte(msg)
+		err = mb.Write(app.ConnIn)
+		if err != nil {
+			log.Println(err)
+		}
+		app.ConnIn.Close()
+	} else {
+		mb := &message.Transport{}
+		msg := "ok"
+		mb.Length = len(msg)
+		mb.Data = []byte(msg)
+		err = mb.Write(app.ConnIn)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	}
+
 }
